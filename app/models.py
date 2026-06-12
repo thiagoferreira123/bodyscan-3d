@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -62,6 +64,10 @@ class AnalysisResponse(BaseModel):
     bmr: float
     tdee: float
     waist_cm: float
+    # Honest uncertainty band [low, high] for waist, in cm. Optional/back-compat.
+    waist_cm_range: Optional[list[float]] = None
+    # Per-measurement validation MAE (cm). Optional/back-compat.
+    measurement_mae_cm: Optional[dict[str, float]] = None
     measurements: MeasurementsResponse
     calculated_metrics: CalculatedMetrics
     model_predictions: ModelPredictions
