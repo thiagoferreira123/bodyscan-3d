@@ -4,7 +4,8 @@ Stage A: EfficientNet-B0 (CNN) → 14 body measurements
 Stage B: Ensemble (XGBoost + LightGBM + Ridge) → body fat %
 """
 
-import io
+import json
+import logging
 import warnings
 from pathlib import Path
 from typing import Any
@@ -17,9 +18,12 @@ import torch.nn as nn
 import timm
 import xgboost as xgb
 import lightgbm as lgb
-from PIL import Image
+
+from .config import settings
+from .preprocess import preprocess_image, rembg_segment
 
 warnings.filterwarnings("ignore")
+logger = logging.getLogger("bodyscan")
 
 MEASUREMENTS = [
     "neck", "shoulder", "chest", "waist", "hip",
@@ -27,7 +31,57 @@ MEASUREMENTS = [
     "thigh_left", "thigh_right", "calf_left", "calf_right", "wrist",
 ]
 
+# Per-measurement validation MAE (cm) reported by stage_a_v2_best.pth.
+# Used to surface an honest uncertainty band instead of false precision.
+# These are best-case (clean validation) numbers; field error is larger.
+MEASUREMENT_MAE_CM = {
+    "neck": 0.46, "shoulder": 1.27, "chest": 4.0, "waist": 4.76, "hip": 4.08,
+    "bicep_left": 1.77, "bicep_right": 1.77, "forearm_left": 1.38,
+    "forearm_right": 1.38, "thigh_left": 2.63, "thigh_right": 2.61,
+    "calf_left": 1.79, "calf_right": 1.80, "wrist": 0.82,
+}
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Lazily-loaded calibration table: {sex: {measurement: (slope, intercept)}}.
+_CALIBRATION: dict[str, dict[str, tuple[float, float]]] | None = None
+
+
+def _load_calibration() -> dict[str, dict[str, tuple[float, float]]]:
+    """Load optional affine calibration from settings.calibration_path.
+
+    Returns {} (identity / no-op) when no file is configured or it is invalid.
+    """
+    global _CALIBRATION
+    if _CALIBRATION is not None:
+        return _CALIBRATION
+    _CALIBRATION = {}
+    path = settings.calibration_path.strip()
+    if not path:
+        return _CALIBRATION
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        _CALIBRATION = {
+            sex: {m: (float(v[0]), float(v[1])) for m, v in table.items()}
+            for sex, table in raw.items()
+        }
+        logger.info("Loaded measurement calibration from %s", path)
+    except Exception:
+        logger.exception("Failed to load calibration (%s); using identity", path)
+        _CALIBRATION = {}
+    return _CALIBRATION
+
+
+def apply_calibration(measurements: dict[str, float], gender: str) -> dict[str, float]:
+    """Apply `corrected = slope * pred + intercept` per measurement, if configured."""
+    table = _load_calibration().get(gender, {})
+    if not table:
+        return measurements
+    out = dict(measurements)
+    for name, (slope, intercept) in table.items():
+        if name in out:
+            out[name] = slope * out[name] + intercept
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -163,15 +217,18 @@ def load_stage_b(models_dir: Path) -> tuple[dict, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Image Preprocessing
+# Image Preprocessing  (see app/preprocess.py)
 # ---------------------------------------------------------------------------
 
-def preprocess_image(image_bytes: bytes) -> torch.Tensor:
-    """Convert raw image bytes to a normalized grayscale 224x224 tensor."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("L")
-    img = img.resize((224, 224))
-    arr = np.array(img) / 255.0
-    return torch.FloatTensor(arr).unsqueeze(0).unsqueeze(0)  # [1, 1, 224, 224]
+def _prep(image_bytes: bytes) -> torch.Tensor:
+    """Preprocess one image according to runtime settings (defaults to legacy)."""
+    segment = rembg_segment if settings.enable_segmentation else None
+    return preprocess_image(
+        image_bytes,
+        mode=settings.preprocess_mode,       # "legacy" by default
+        segment=segment,
+        pad=settings.letterbox_pad,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +242,8 @@ def predict_measurements(
     side_bytes: bytes,
 ) -> dict[str, float]:
     """Predict 14 body measurements from front+side silhouette images."""
-    front_tensor = preprocess_image(front_bytes).to(DEVICE)
-    side_tensor = preprocess_image(side_bytes).to(DEVICE)
+    front_tensor = _prep(front_bytes).to(DEVICE)
+    side_tensor = _prep(side_bytes).to(DEVICE)
 
     # Concatenate front and side along channel dim → [1, 2, 224, 224]
     silhouettes = torch.cat([front_tensor, side_tensor], dim=1)
@@ -365,6 +422,22 @@ def run_inference(
         stage_a_model, stage_a_scaler, front_image_bytes, side_image_bytes,
     )
 
+    # Optional: replace the model waist with a height-anchored geometric
+    # measurement of the uploaded silhouettes (off by default).
+    if settings.waist_method == "geometry":
+        from .geometry import measure_waist_cm
+        geo = measure_waist_cm(
+            front_image_bytes, side_image_bytes, height_cm,
+            k=settings.waist_geometry_k,
+        )
+        if geo is not None:
+            all_measurements["waist"] = geo
+        else:
+            logger.warning("geometric waist unmeasurable; falling back to model waist")
+
+    # Optional post-hoc bias correction (no-op unless calibration is configured)
+    all_measurements = apply_calibration(all_measurements, gender)
+
     # Stage B: Ensemble → body fat %
     stage_b_result = predict_bodyfat(
         stage_b_male, stage_b_female,
@@ -388,6 +461,11 @@ def run_inference(
 
     tdee = bmr * 1.2  # sedentary factor
 
+    # Honest uncertainty band for waist (± validation MAE). Field error is larger;
+    # this exists so the UI can stop showing false precision like "94.27 cm".
+    waist = all_measurements["waist"]
+    waist_mae = MEASUREMENT_MAE_CM["waist"]
+
     return {
         "body_fat_pct": round(bodyfat_pct, 2),
         "lean_mass_kg": round(lean_mass_kg, 2),
@@ -397,7 +475,9 @@ def run_inference(
         "water_pct": round(water_pct, 2),
         "bmr": round(bmr, 2),
         "tdee": round(tdee, 2),
-        "waist_cm": round(all_measurements["waist"], 2),
+        "waist_cm": round(waist, 2),
+        "waist_cm_range": [round(waist - waist_mae, 1), round(waist + waist_mae, 1)],
+        "measurement_mae_cm": MEASUREMENT_MAE_CM,
         "measurements": all_measurements,
         "calculated_metrics": stage_b_result["calculated_metrics"],
         "model_predictions": stage_b_result["model_predictions"],
