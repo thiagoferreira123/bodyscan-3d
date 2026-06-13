@@ -11,3 +11,5 @@ pillow==12.0.0
 scikit-learn==1.6.0
 xgboost==3.1.2
 lightgbm==4.6.0
+rembg==2.0.59
+onnxruntime==1.19.2

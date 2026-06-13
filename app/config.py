@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     waist_method: str = "model"
     # Ellipse shape factor for the geometric waist (calibrated on tape data;
     # 1.04 centers the one known real point on MediaPipe silhouettes).
-    waist_geometry_k: float = 1.04
+    waist_geometry_k: float = 1.08
 
     # --- Post-hoc calibration --------------------------------------------
     # Optional JSON with per-sex, per-measurement affine correction:

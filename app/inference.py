@@ -423,17 +423,21 @@ def run_inference(
     )
 
     # Optional: replace the model waist with a height-anchored geometric
-    # measurement of the uploaded silhouettes (off by default).
+    # measurement. The user's ORIGINAL photo is untouched (stored/displayed as
+    # sent); we segment it here only to measure, then discard the silhouette.
     if settings.waist_method == "geometry":
         from .geometry import measure_waist_cm
-        geo = measure_waist_cm(
-            front_image_bytes, side_image_bytes, height_cm,
-            k=settings.waist_geometry_k,
-        )
-        if geo is not None:
-            all_measurements["waist"] = geo
+        from .segment import photo_to_silhouette, arms_separated
+        fsil = photo_to_silhouette(front_image_bytes)
+        ssil = photo_to_silhouette(side_image_bytes)
+        if fsil and ssil and arms_separated(fsil):
+            geo = measure_waist_cm(fsil, ssil, height_cm, k=settings.waist_geometry_k)
+            if geo is not None:
+                all_measurements["waist"] = geo
+            else:
+                logger.warning("geometric waist unmeasurable; using model waist")
         else:
-            logger.warning("geometric waist unmeasurable; falling back to model waist")
+            logger.warning("bad capture (no person / arms merged); using model waist")
 
     # Optional post-hoc bias correction (no-op unless calibration is configured)
     all_measurements = apply_calibration(all_measurements, gender)
